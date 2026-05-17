@@ -19,6 +19,47 @@ Day 1 Assignment 3 — three intentionally-broken AWS/Terraform scenarios diagno
 
 ---
 
-## Scenario 1 RCA — TBD
+## Scenario 1 RCA — EC2 unreachable due to NACL ephemeral port gap
+
+**Symptom**
+
+`curl -v --max-time 10 http://<public-ip>` against a freshly applied t3.micro web server timed out at the TCP handshake — `Trying <ip>:80...` followed by `Connection timed out after 10004 milliseconds`. No SYN-ACK ever returned. The instance was `running` with 3/3 status checks passing, so the host and nginx were healthy; the failure was below the application layer.
+
+**Diagnosis path**
+
+1. `aws ec2 describe-instance-status` — confirmed instance state `running`, both status checks `ok`. Ruled out host failure and confirmed user-data succeeded (system reachability check exercises outbound packet path, so dnf must have reached the repos).
+2. `aws ec2 describe-security-groups` on the instance's SG — ingress TCP/80 from `0.0.0.0/0`, egress all. SG is stateful, return traffic is automatic. Ruled out SG.
+3. `aws ec2 describe-route-tables` on the public subnet — `0.0.0.0/0` route to the IGW present, subnet correctly associated. Ruled out routing.
+4. `aws ec2 describe-network-acls` on the public subnet — found the ingress rules allowed TCP/80 and ephemeral 1024–65535, but the **egress** rules only allowed destination TCP/80 and TCP/443. Outbound replies from nginx (going to the client's ephemeral source port, e.g. 55295) were being dropped by the implicit `deny` rule 32767. Confirmed root cause.
+
+**Root cause**
+
+The NACL allowed inbound ephemeral ports (for return traffic from outbound HTTPS to package repos) but did not allow outbound ephemeral ports — so reply packets from nginx back to client ephemeral ports were dropped. NACLs are stateless: every direction must be explicitly allowed, and "return traffic" is a concept that does not exist at the NACL layer.
+
+**Fix**
+
+Added a third egress rule to `aws_network_acl.public` allowing TCP destination ports 1024–65535 to `0.0.0.0/0`:
+
+```hcl
+egress {
+  rule_no    = 120
+  protocol   = "tcp"
+  action     = "allow"
+  cidr_block = "0.0.0.0/0"
+  from_port  = 1024
+  to_port    = 65535
+}
+```
+
+**Validation**
+
+`curl -v --max-time 10 http://<public-ip>` returned `HTTP/1.1 200 OK` with the placeholder body. The client source port (55295) was within the newly allowed ephemeral range, confirming the fix targeted the exact packet flow that was being dropped.
+
+**Prevention**
+
+- `checkov` rule `CKV2_AWS_1` (NACL must allow ephemeral ports for return traffic) would have flagged this at PR time.
+- Default to SG-only for subnet ACLs unless there's a compliance reason for a custom NACL. SGs are stateful and forgive this entire class of bug.
+- If a custom NACL is required, write it as a matched pair: every inbound `allow` for a service port needs a corresponding outbound `allow` for ephemeral source ports, and vice versa.
+- A post-apply smoke test (`curl --max-time 10` from the CI runner or a deploy script) would have caught this within 90 seconds of apply, before the change ever propagated to anything that mattered.
 ## Scenario 2 RCA — TBD
 ## Scenario 3 RCA — TBD
