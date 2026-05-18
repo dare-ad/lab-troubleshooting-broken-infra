@@ -1,3 +1,4 @@
+
 # lab-troubleshooting-broken-infra
 
 Day 1 Assignment 3 — three intentionally-broken AWS/Terraform scenarios diagnosed with AWS CLI, fixed in Terraform, and documented with an RCA.
@@ -91,4 +92,85 @@ Two one-line changes to `main.tf`. See `scenario-02-iam/main.tf` vs `scenario-02
 - **End-to-end smoke test in CI.** A post-apply test that does `aws lambda invoke` and `aws s3 ls` against the bucket would have caught bug 2 within seconds of apply, instead of letting it accumulate as silent CloudWatch errors that nobody is paged on.
 - **CloudWatch alarm on Lambda `Errors` metric.** A `Errors > 0` alarm at the function level would surface any silently-failing handler within one evaluation period, even when EventBridge happily keeps firing.
 - **Bonus: `Resource: "*"` is sometimes the right answer for write-heavy logs/metrics statements, but for the data path always be specific. The `WriteHeartbeat` policy should be scoped to `<bucket-arn>/heartbeat/*` not the whole bucket, to limit blast radius if the function were ever compromised.**
-## Scenario 3 RCA — TBD
+## Scenario 3 RCA — Terraform state drift, three patterns, three reconciliation strategies
+
+**Symptom**
+
+Following the clean baseline `terraform apply`, three out-of-band changes were made via AWS API (simulating real-world Console activity, compliance automation, and clickops): (1) S3 bucket versioning suspended; (2) two unexpected tags added to a DynamoDB table; (3) a new DynamoDB table created entirely outside Terraform. A subsequent `terraform plan` reported `2 to change, 0 to destroy` and was *silent* about the third drift entirely.
+
+**Diagnosis path**
+
+1. **`terraform plan`** detected drifts 1 and 2 by refreshing state from AWS and comparing against `main.tf`. Versioning showed `Suspended -> Enabled` (state wants Enabled, reality is Suspended). Tags showed `CostCenter` and `ManagedBy` with `-> null` arrows, meaning `apply` would *delete* them.
+2. **`terraform plan` did not detect drift 3.** This is the critical lesson: `plan` only refreshes resources already in state. Out-of-band resource creation is invisible to it. Detection required cross-referencing `aws dynamodb list-tables` (filtered by lab tag) against `terraform state list`.
+
+**Root cause**
+
+Three independent drifts, each with a different reconciliation strategy:
+
+| Drift | Description | Source of truth | Strategy |
+|-------|-------------|-----------------|----------|
+| 1 | Versioning suspended out of band | **Code** (versioning is a recovery control; the code reflects the policy intent) | `terraform apply` — push code's truth onto AWS |
+| 2 | Tags added by external system | **AWS** (compliance automation will keep re-adding them; fighting it produces drift loops) | Adopt the tags in `main.tf` + `lifecycle.ignore_changes` to prevent future drift loops |
+| 3 | Unmanaged table created | **AWS** (table exists with data; destroying it would be destructive) | `terraform import` to bring the resource under management; write faithful HCL until `plan` reports clean |
+
+The deeper root cause is process, not config: out-of-band changes occurred without going through PR-reviewed Terraform. Without preventive controls (SCPs, drift-detection scheduled jobs, "code-only changes" team policy), this divergence accumulates silently.
+
+**Fix**
+
+- Drift 1: `terraform apply` restored versioning to `Enabled`.
+- Drift 2: Added `ManagedBy` and `CostCenter` to `aws_dynamodb_table.sessions.tags`, and added a `lifecycle.ignore_changes` block listing both `tags["KEY"]` and `tags_all["KEY"]` to suppress future drift on the externally-managed values.
+- Drift 3: Wrote `aws_dynamodb_table.sessions_audit` block in `main.tf`, then `terraform import aws_dynamodb_table.sessions_audit lab-sessions-audit-<suffix>`, then verified `terraform plan` reported `No changes` — confirming the HCL faithfully represents the live resource.
+
+**Validation**
+
+After all three reconciliations, `terraform plan` reported `No changes. Your infrastructure matches the configuration.` `terraform state list` returned all 6 managed resources including the imported audit table. The out-of-band cross-reference query (list-tables filtered by lab tag vs. state list) now matched exactly — zero unmanaged resources with the lab tag.
+
+**Prevention**
+
+- **Drift detection in CI/CD**: nightly scheduled `terraform plan -detailed-exitcode` against every workspace; exit code 2 means drift; page on it. Catches drifts 1 and 2 within a day.
+- **Cross-reference detection**: a custom job that compares tagged AWS resources against state and alerts on any in-AWS-not-in-state. Catches drift 3, which `plan` will never see.
+- **SCP "no console writes" for IaC-managed accounts**: deny `*:Create*`, `*:Update*`, `*:Tag*`, `*:Put*` calls from non-CI principals. Stops the drifts from happening in the first place. Common pattern in landing-zone designs (this is exactly what XccelerATOr-style platforms enforce in regulated accounts).
+- **`lifecycle.ignore_changes` for cross-system fields**: any attribute touched by another automated system (cost-allocation tags, security-scanner annotations, K8s controller annotations) gets ignored in Terraform from day one. Documents the boundary between systems.
+- **`terraform import` discipline**: never `apply` after import until `plan` returns clean. A mismatch between imported state and HCL can cause destructive corrections.
+## Scenario 3 RCA — Terraform state drift, three patterns, three reconciliation strategies
+
+**Symptom**
+
+Following the clean baseline `terraform apply`, three out-of-band changes were made via AWS API (simulating real-world Console activity, compliance automation, and clickops): (1) S3 bucket versioning suspended; (2) two unexpected tags added to a DynamoDB table; (3) a new DynamoDB table created entirely outside Terraform. A subsequent `terraform plan` reported `2 to change, 0 to destroy` and was *silent* about the third drift entirely.
+
+**Diagnosis path**
+
+1. **`terraform plan`** detected drifts 1 and 2 by refreshing state from AWS and comparing against `main.tf`. Versioning showed `Suspended -> Enabled` (state wants Enabled, reality is Suspended). Tags showed `CostCenter` and `ManagedBy` with `-> null` arrows, meaning `apply` would *delete* them.
+2. **`terraform plan` did not detect drift 3.** This is the critical lesson: `plan` only refreshes resources already in state. Out-of-band resource creation is invisible to it. Detection required cross-referencing `aws dynamodb list-tables` (filtered by lab tag) against `terraform state list`.
+
+**Root cause**
+
+Three independent drifts, each with a different reconciliation strategy:
+
+| Drift | Description | Source of truth | Strategy |
+|-------|-------------|-----------------|----------|
+| 1 | Versioning suspended out of band | **Code** (versioning is a recovery control; the code reflects the policy intent) | `terraform apply` — push code's truth onto AWS |
+| 2 | Tags added by external system | **AWS** (compliance automation will keep re-adding them; fighting it produces drift loops) | Adopt the tags in `main.tf` + `lifecycle.ignore_changes` to prevent future drift loops |
+| 3 | Unmanaged table created | **AWS** (table exists with data; destroying it would be destructive) | `terraform import` to bring the resource under management; write faithful HCL until `plan` reports clean |
+
+The deeper root cause is process, not config: out-of-band changes occurred without going through PR-reviewed Terraform. Without preventive controls (SCPs, drift-detection scheduled jobs, "code-only changes" team policy), this divergence accumulates silently.
+
+**Fix**
+
+- Drift 1: `terraform apply` restored versioning to `Enabled`.
+- Drift 2: Added `ManagedBy` and `CostCenter` to `aws_dynamodb_table.sessions.tags`, and added a `lifecycle.ignore_changes` block listing both `tags["KEY"]` and `tags_all["KEY"]` to suppress future drift on the externally-managed values.
+- Drift 3: Wrote `aws_dynamodb_table.sessions_audit` block in `main.tf`, then `terraform import aws_dynamodb_table.sessions_audit lab-sessions-audit-<suffix>`, then verified `terraform plan` reported `No changes` — confirming the HCL faithfully represents the live resource.
+
+**Validation**
+
+After all three reconciliations, `terraform plan` reported `No changes. Your infrastructure matches the configuration.` `terraform state list` returned all 6 managed resources including the imported audit table. The out-of-band cross-reference query (list-tables filtered by lab tag vs. state list) now matched exactly — zero unmanaged resources with the lab tag.
+
+**Prevention**
+
+- **Drift detection in CI/CD**: nightly scheduled `terraform plan -detailed-exitcode` against every workspace; exit code 2 means drift; page on it. Catches drifts 1 and 2 within a day.
+- **Cross-reference detection**: a custom job that compares tagged AWS resources against state and alerts on any in-AWS-not-in-state. Catches drift 3, which `plan` will never see.
+- **SCP "no console writes" for IaC-managed accounts**: deny `*:Create*`, `*:Update*`, `*:Tag*`, `*:Put*` calls from non-CI principals. Stops the drifts from happening in the first place. Common pattern in landing-zone designs (this is exactly what XccelerATOr-style platforms enforce in regulated accounts).
+- **`lifecycle.ignore_changes` for cross-system fields**: any attribute touched by another automated system (cost-allocation tags, security-scanner annotations, K8s controller annotations) gets ignored in Terraform from day one. Documents the boundary between systems.
+- **`terraform import` discipline**: never `apply` after import until `plan` returns clean. A mismatch between imported state and HCL can cause destructive corrections.
+
+See `scenario-03-state/introduce-drift.sh` for a reproducible drift script.
